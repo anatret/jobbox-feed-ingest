@@ -134,5 +134,10 @@
     "kakao": "Постоянка в Инчене",
     "source": "kakao/postoyanka-incheon",
     "note": "открытый чат KakaoTalk, очередь kakao_inbox с телефона владельца"
+  },
+  {
+    "kakao": "AK Korea - Работа в Корее",
+    "source": "kakao/akkorea",
+    "note": "открытый чат KakaoTalk, вся Корея; очередь kakao_inbox с телефона владельца"
   }
 ]
