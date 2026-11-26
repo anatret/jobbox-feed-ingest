@@ -282,16 +282,103 @@ FAR_RE = re.compile(
     r'|Мокпо|Синан|Х[эе]нам|Ёсу|Кванъян|Наджу|Кванджу|Сунчхон|Каннын|Донхе'
     r'|Тонхе|Самчхок|Сокчхо|Вонджу|Чхунджу|Чечхон|Намъянджу|Намьянджу|Ыйджонбу'
     r'|Пхочхон|Пачжу|Паджу|Сеул|Ичхон|Ёджу|Чеджу|Сосан|Танджин|Тхэан|Иксан'
-    r'|Кунсан|Чонджу|Ёнджу|Андон|Ульджин|Чхунчхон', re.I)
+    r'|Кунсан|Чонджу|Ёнджу|Андон|Ульджин|Чхунчхон'
+    # Корейские объявления пишут место по-корейски («강원 인제», «경기 이천»).
+    r'|부산|김해|진영|거제|울산|양산|대구|경남|경북|경상|구미|경주|포항|목포|신안|해남'
+    r'|여수|광양|나주|순천|전남|전북|전라|익산|군산|전주|강원|강릉|원주|춘천|동해|삼척'
+    r'|속초|충주|제천|남양주|의정부|포천|파주|서울|이천|여주|제주|서산|당진|태안|영주'
+    r'|안동|울진', re.I)
 OURS_RE = re.compile(
     r'Ансан|Шива|Сихын|Хвасон|Хвасонг|Инчхон|Инчон|Кимпо|Кимпхо|Пучхон|Сувон'
     r'|Ёнин|Йонин|Пх?ёнт[эе]?к|Осан|Посын|Паран|Ансон|Нери|Чхонан|Чонан|Асан'
-    r'|Чхонджу|Тэджон|Ымсон|Кунпхо|Кунпо|Анян|Ыйван', re.I)
+    r'|Чхонджу|Тэджон|Ымсон|Кунпхо|Кунпо|Анян|Ыйван'
+    r'|안산|시흥|화성|향남|인천|김포|부천|수원|용인|평택|오산|안성|천안|아산|청주|세종'
+    r'|대전|음성|군포|안양|의왕', re.I)
 
 
 def is_far(place: str, title: str = '') -> bool:
     s = f'{place} {title}'
     return bool(FAR_RE.search(s)) and not OURS_RE.search(s)
+
+
+# ---------- несколько объявлений в одном тексте ----------
+
+# Заголовок сообщения, скопированного из чата: «[26.11.2026 6:00] Сандра: …»
+# (Telegram на телефоне, tool/tg_fetch.py) или строка «Сандра, [26.11.2026 6:00]»
+# (Telegram Desktop). Пользователи вставляют в «Добавить объявление» куски чата.
+_STAMP = r'\d{1,2}\.\d{1,2}(?:\.\d{2,4})?,?\s+\d{1,2}:\d{2}(?::\d{2})?'
+CHAT_HEAD_RE = re.compile(
+    r'^\[' + _STAMP + r'\][ \t]*([^\n:\[\]]{1,60}):[ \t]*'
+    r'|^([^\n:\[\]]{1,60}),[ \t]*\[' + _STAMP + r'\][ \t]*$', re.M)
+# Разделитель между вакансиями — строка из одних «____», «———», «====».
+SEP_RE = re.compile(r'^[ \t]*[_\-—–=─━~*•·.]{5,}[ \t]*$', re.M)
+MAX_PARTS = 12
+MIN_PART = 25  # короче — подпись или «[ Фотография ]», не вакансия
+
+
+def split_parts(text: str) -> list[tuple[str, Optional[str]]]:
+    """Текст → части, которые модель разбирает по одной: (текст, отправитель).
+
+    Модель склеивает вакансии одного поста через «____» и теряет все, кроме
+    первой, в длинном куске чата. Поэтому режем сами:
+      * по заголовкам сообщений чата — сообщение без телефона (вопрос,
+        «ищу работу», разговор) отбрасываем, имя из заголовка — отправитель;
+      * внутри сообщения — по строкам-разделителям, но только если в каждом
+        куске свой телефон (иначе разделитель — оформление одной вакансии:
+        «ГРАФИК ——— ЗАРПЛАТА»).
+    Нумерованные «1. 2.» не режем — их модель делит сама.
+    """
+    heads = list(CHAT_HEAD_RE.finditer(text))
+    if heads:
+        msgs = [(text[:heads[0].start()], None)]
+        for i, h in enumerate(heads):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+            name = (h.group(1) or h.group(2)).strip()
+            # Отправитель-эмодзи («🤩») — не имя: модель подпишет «Работодатель».
+            msgs.append((text[h.end():end], name if re.search(r'[^\W\d_]', name) else None))
+    else:
+        msgs = [(text, None)]
+    parts = []
+    for body, sender in msgs:
+        body = body.strip()
+        if not phones_of(body):
+            continue
+        pieces = [x.strip() for x in SEP_RE.split(body)]
+        pieces = [x for x in pieces if len(x) >= MIN_PART]
+        if len(pieces) > 1 and all(phones_of(x) for x in pieces):
+            parts += [(x, sender) for x in pieces]
+        else:
+            parts.append((body, sender))
+    return parts[:MAX_PARTS] or [(text, None)]
+
+
+# Пометка к телефону — только если в тексте о связи что-то сказано: модель
+# любит дописывать «Только звонки» от себя (2026-11-26: в 7 карточках из 9).
+NOTE_HINT_RE = re.compile(
+    r'звон|смс|sms|сообщ|напиш|пиши|whats|ват[сц]|вотс|телеграм|telegram|kakao|какао'
+    r'|рус|узб|каз|кыр|корейск|англ|не\s*дозвон|не\s*ответ|не\s*бер', re.I)
+CALLS_ONLY_RE = re.compile(
+    r'только\s+звон|звонки\s+только|без\s+(?:смс|sms)|(?:смс|sms)\s+не\s|не\s+пиш', re.I)
+
+
+def clean_note(note: Optional[str], text: str) -> Optional[str]:
+    """Пометка модели к телефону, если текст её подтверждает, иначе None."""
+    if not note or not NOTE_HINT_RE.search(text):
+        return None
+    if re.search(r'только\s+звон', note, re.I) and not CALLS_ONLY_RE.search(text):
+        return None
+    return note
+
+
+# «Нужна своя машина» — только если машина в тексте упомянута: модель ставит
+# её на «развоза нет, добираться самим».
+CAR_RE = re.compile(
+    r'машин|сво[а-яё]*\s+авто|на\s+авто|с\s+авто|личн[а-яё]*\s+авто|자차|водител'
+    r'|с\s+правами', re.I)
+
+
+def confirm_car(flag: bool, text: str) -> bool:
+    return bool(flag and CAR_RE.search(text))
 
 
 def slugify(hint: str, h: str, prefix: str = 'tg') -> str:
@@ -411,14 +498,16 @@ class Parser:
         raise RuntimeError('OpenAI: пустой ответ')
 
 
-def to_row(item: Item, slug: str) -> dict:
+def to_row(item: Item, slug: str, text: str) -> dict:
+    """text — часть сообщения, из которой модель сделала эту карточку."""
     a = item.ad
     contacts = []
     for c in a.contacts:
         d = re.sub(r'\D', '', c.phone)
         if re.fullmatch(r'01\d{8,9}', d):
+            note = clean_note(c.note, text)
             contacts.append({k: v for k, v in
-                             {'phone': d, 'name': c.name, 'note': c.note}.items() if v})
+                             {'phone': d, 'name': c.name, 'note': note}.items() if v})
     if not contacts:
         raise ValueError('нет корректного телефона')
     return {
@@ -426,7 +515,8 @@ def to_row(item: Item, slug: str) -> dict:
         'work': a.work, 'schedule': a.schedule, 'pay': a.pay,
         'audience': a.audience, 'age': a.age, 'visas': a.visas,
         'transport': a.transport, 'conditions': a.conditions, 'rhythm': a.rhythm,
-        'has_shuttle': a.has_shuttle, 'needs_car': a.needs_car, 'urgent': a.urgent,
+        'has_shuttle': a.has_shuttle, 'needs_car': confirm_car(a.needs_car, text),
+        'urgent': a.urgent,
         # Ставка и смена — для фильтров ленты; неправдоподобную ставку
         # ingest_upsert_ad запишет как не указанную.
         'hourly_rate': a.hourly_rate,
@@ -594,22 +684,30 @@ async def run() -> int:
 
             try:
                 cands = db.rpc('ingest_find_by_phones', {'p_phones': phones})
-                dec = parser.decide(text, m.sender, m.date, cands)
+                # Несколько вакансий в одном тексте — модель разбирает каждую
+                # часть отдельно (split_parts).
+                pairs, reasons = [], []
+                for part, who in split_parts(text):
+                    dec = parser.decide(part, who or m.sender, m.date, cands)
+                    pairs += [(it, part) for it in dec.items]
+                    if dec.skip_reason:
+                        reasons.append(dec.skip_reason)
                 # Далёкие города отсекаем сами: модель иногда пропускает их.
-                far = [it for it in dec.items if is_far(it.ad.place, it.ad.title)]
-                if far:
-                    dec.items = [it for it in dec.items if it not in far]
-                    if not dec.items:
-                        dec.skip_reason = f'далёкий регион: {far[0].ad.place}'[:200]
-                if not dec.items:
+                far = [it for it, _ in pairs if is_far(it.ad.place, it.ad.title)]
+                pairs = [(it, part) for it, part in pairs if it not in far]
+                if not pairs:
+                    reason = (f'далёкий регион: {far[0].ad.place}' if far
+                              else (reasons[0] if reasons else ''))[:200] or None
                     stats['skip'] += 1
-                    skipped.append(dec.skip_reason or '—')
-                    db.log(**base, decision='skip', note=dec.skip_reason)
+                    skipped.append(reason or '—')
+                    db.log(**base, decision='skip', note=reason)
                 else:
                     slugs, kinds = [], set()
                     known = {c['slug'] for c in cands}
-                    for it in dec.items:
-                        if it.action == 'update' and it.update_slug in known:
+                    for it, part in pairs:
+                        # Две части не обновляют одну карточку: вторая — новая.
+                        if (it.action == 'update' and it.update_slug in known
+                                and it.update_slug not in slugs):
                             slug = it.update_slug
                             kinds.add('update')
                             upd_titles.append(it.ad.title)
@@ -621,7 +719,7 @@ async def run() -> int:
                                 n += 1
                             kinds.add('new')
                             new_titles.append(f'{it.ad.title} ({it.ad.place})')
-                        row = to_row(it, slug)
+                        row = to_row(it, slug, part)
                         if not DRY:
                             db.rpc('ingest_upsert_ad', {'p': row})
                         slugs.append(slug)
