@@ -111,6 +111,26 @@
     "note": "Кёнгидо"
   },
   {
+    "chat": "rabota_korea",
+    "note": "Канал агентов, Ансан, Инчхон, Хвасон"
+  },
+  {
+    "chat": "rabota_v_korea",
+    "note": "Вся Корея"
+  },
+  {
+    "chat": "AkKorea",
+    "note": "Кёнгидо, Ансан; чат №2 команды akorea"
+  },
+  {
+    "chat": "hwaseong_city",
+    "note": "Хвасон"
+  },
+  {
+    "chat": "pyeongtaek_city",
+    "note": "Пхёнтхэк"
+  },
+  {
     "kakao": "Постоянка в Инчене",
     "source": "kakao/postoyanka-incheon",
     "note": "открытый чат KakaoTalk, очередь kakao_inbox с телефона владельца"
