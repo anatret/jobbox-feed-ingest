@@ -739,10 +739,15 @@ async def run() -> int:
                 # Далёкие города отсекаем сами: модель иногда пропускает их.
                 far = [it for it, _ in pairs if is_far(it.ad.place, it.ad.title)]
                 pairs = [(it, part) for it, part in pairs if it not in far]
-                # Сомнительное и запрещённое — не в ленту, а владельцу на
-                # проверку (очередь «Добавить объявление», ingest_hold).
-                held = [(it, part) for it, part in pairs if it.moderation.verdict != 'ok']
+                # Сомнительное — не в ленту, а владельцу на проверку (очередь
+                # «Добавить объявление», ingest_hold). Запрещённое (платное
+                # трудоустройство, ночная сфера, деньги вперёд…) владельцу не
+                # шлём — решение и так понятно: пропуск.
+                banned = [it for it, _ in pairs if it.moderation.verdict == 'forbidden']
+                held = [(it, part) for it, part in pairs if it.moderation.verdict == 'doubtful']
                 pairs = [(it, part) for it, part in pairs if it.moderation.verdict == 'ok']
+                banned_note = ('запрещено: ' + '; '.join(
+                    it.moderation.reason or 'forbidden' for it in banned)) if banned else None
                 held_note = None
                 if held:
                     if not DRY:
@@ -756,7 +761,8 @@ async def run() -> int:
                 if not pairs and held:
                     db.log(**base, decision='hold', note=held_note[:500])
                 elif not pairs:
-                    reason = (far_reason(far[0].ad.place, far[0].ad.title) if far
+                    reason = (banned_note if banned
+                              else far_reason(far[0].ad.place, far[0].ad.title) if far
                               else (reasons[0] if reasons else ''))[:200] or None
                     stats['skip'] += 1
                     skipped.append(reason or '—')
@@ -785,7 +791,7 @@ async def run() -> int:
                         slugs.append(slug)
                     kind = 'new' if 'new' in kinds else 'update'
                     stats[kind] += 1
-                    note = '; '.join(x for x in [cut[2:], held_note] if x) or None
+                    note = '; '.join(x for x in [cut[2:], held_note, banned_note] if x) or None
                     db.log(**base, decision=kind, slugs=slugs,
                            note=note[:500] if note else None)
             except Exception as e:  # одно сообщение не должно ронять весь проход
