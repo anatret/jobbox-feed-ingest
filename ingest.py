@@ -301,6 +301,13 @@ def is_far(place: str, title: str = '') -> bool:
     return bool(FAR_RE.search(s)) and not OURS_RE.search(s)
 
 
+def far_reason(place: str, title: str = '') -> str:
+    """Причина пропуска: найденный далёкий город, а не поле «место» — оно
+    бывает «Место скажут по телефону», когда город только в заголовке."""
+    m = FAR_RE.search(f'{place} {title}')
+    return f'далёкий регион: {m.group(0) if m else place}'
+
+
 # ---------- несколько объявлений в одном тексте ----------
 
 # Заголовок сообщения, скопированного из чата: «[26.11.2026 6:00] Сандра: …»
@@ -696,7 +703,7 @@ async def run() -> int:
                 far = [it for it, _ in pairs if is_far(it.ad.place, it.ad.title)]
                 pairs = [(it, part) for it, part in pairs if it not in far]
                 if not pairs:
-                    reason = (f'далёкий регион: {far[0].ad.place}' if far
+                    reason = (far_reason(far[0].ad.place, far[0].ad.title) if far
                               else (reasons[0] if reasons else ''))[:200] or None
                     stats['skip'] += 1
                     skipped.append(reason or '—')
