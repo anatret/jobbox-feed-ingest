@@ -131,6 +131,26 @@
     "note": "Пхёнтхэк"
   },
   {
+    "chat": "dynamic_korea",
+    "note": "Вся Корея: Инчхон, Кимпо, Ансон"
+  },
+  {
+    "chat": "korjobb",
+    "note": "Вся Корея"
+  },
+  {
+    "chat": "anseongwork",
+    "note": "Канал, Ансон-Нери"
+  },
+  {
+    "chat": "ansansadonrabota",
+    "note": "Ансан"
+  },
+  {
+    "chat": "arbaytincheonkimpo",
+    "note": "Инчхон, Кимпо"
+  },
+  {
     "kakao": "Постоянка в Инчене",
     "source": "kakao/postoyanka-incheon",
     "note": "открытый чат KakaoTalk, очередь kakao_inbox с телефона владельца"
