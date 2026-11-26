@@ -7,9 +7,12 @@
   1. Нет телефона → пропуск без вызова модели.
   2. Тот же текст уже разбирали (другая группа / повторный пост) → поднять
      те же карточки в ленте (не чаще раза в час), модель не вызываем.
-  3. Иначе модель OpenAI разбирает сообщение по правилам (prompt.md): пропустить,
-     новая карточка или обновить существующую (кандидаты — карточки с тем же
-     телефоном из базы) → запись через RPC ingest_upsert_ad.
+  3. Иначе модель OpenAI разбирает сообщение по правилам (prompt.md) — несколько
+     вакансий в одном посте по частям (split_parts): пропустить, новая карточка
+     или обновить существующую (кандидаты — карточки с тем же телефоном из
+     базы) → запись через RPC ingest_upsert_ad. Каждой карточке модель ставит
+     оценку: ok — в ленту; сомнительное и запрещённое — не в ленту, а владельцу
+     на проверку (RPC ingest_hold → очередь ad_submissions).
   4. Журнал feed_ingest_log, состояние feed_ingest_state, отчёт в Telegram.
 
 KakaoTalk: телефон владельца (tool/kakao_collector в jobboxv3) кладёт
@@ -105,11 +108,18 @@ class Ad(BaseModel):
     contacts: list[Contact]
 
 
+class Moderation(BaseModel):
+    verdict: Literal['ok', 'doubtful', 'forbidden'] = Field(
+        description='ok — публикуем; doubtful / forbidden — на проверку владельцу')
+    reason: Optional[str] = Field(default=None, description='Почему не ok — коротко')
+
+
 class Item(BaseModel):
     action: Literal['new', 'update']
     update_slug: Optional[str] = Field(
         default=None, description='Для update — slug из списка существующих карточек')
     slug_hint: str = Field(description='Латиница kebab-case: имя-место-суть, для new')
+    moderation: Moderation
     ad: Ad
 
 
@@ -157,7 +167,7 @@ class Db:
         r = self.http.get('/feed_ingest_log', params={
             'select': 'decision,slugs,created_at',
             'text_hash': f'eq.{text_hash}',
-            'decision': 'in.(new,update,bump,skip)',
+            'decision': 'in.(new,update,bump,skip,hold)',
             'created_at': f'gte.{since}',
             'order': 'created_at.desc', 'limit': '1'})
         r.raise_for_status()
@@ -172,7 +182,7 @@ class Db:
         r = self.http.get('/feed_ingest_log', params={
             'select': 'decision,slugs,text_norm',
             'phones': f'ov.{{{",".join(phones)}}}',
-            'decision': 'in.(new,update,bump)',
+            'decision': 'in.(new,update,bump,hold)',
             'text_norm': 'not.is.null',
             'created_at': f'gte.{since}',
             'order': 'created_at.desc', 'limit': '40'})
@@ -186,7 +196,7 @@ class Db:
         r = self.http.get('/feed_ingest_log', params={
             'select': 'decision,slugs,text_norm',
             'source': f'eq.{source}',
-            'decision': 'in.(new,update,bump)',
+            'decision': 'in.(new,update,bump,hold)',
             'text_norm': 'not.is.null',
             'created_at': f'gte.{since}',
             'order': 'created_at.desc', 'limit': '500'})
@@ -406,11 +416,20 @@ DECISION_SCHEMA = {
         'skip_reason': _nullable('string'),
         'items': {'type': 'array', 'items': {
             'type': 'object', 'additionalProperties': False,
-            'required': ['action', 'update_slug', 'slug_hint', 'ad'],
+            'required': ['action', 'update_slug', 'slug_hint', 'moderation', 'ad'],
             'properties': {
                 'action': {'type': 'string', 'enum': ['new', 'update']},
                 'update_slug': _nullable('string'),
                 'slug_hint': {'type': 'string'},
+                'moderation': {
+                    'type': 'object', 'additionalProperties': False,
+                    'required': ['verdict', 'reason'],
+                    'properties': {
+                        'verdict': {'type': 'string',
+                                    'enum': ['ok', 'doubtful', 'forbidden']},
+                        'reason': _nullable('string'),
+                    },
+                },
                 'ad': {
                     'type': 'object', 'additionalProperties': False,
                     'required': ['title', 'city', 'place', 'work', 'schedule', 'pay',
@@ -535,6 +554,24 @@ def to_row(item: Item, slug: str, text: str) -> dict:
     }
 
 
+def to_item(item: Item, text: str, cands: list[dict]) -> dict:
+    """Карточка на проверку владельцу — в виде items очереди ad_submissions
+    (как decisionToItems в submit-job-ad): поля ingest_upsert_ad без slug и
+    posted_at, плюс action / update_slug / update_title / slug_hint / moderation."""
+    titles = {c['slug']: c['title'] for c in cands}
+    row = to_row(item, '', text)
+    del row['slug'], row['posted_at']
+    update = item.action == 'update' and item.update_slug in titles
+    return {
+        'action': 'update' if update else 'new',
+        'update_slug': item.update_slug if update else None,
+        'update_title': titles.get(item.update_slug) if update else None,
+        'slug_hint': item.slug_hint,
+        'moderation': item.moderation.model_dump(),
+        **row,
+    }
+
+
 # ---------- источники ----------
 
 @dataclass
@@ -627,7 +664,7 @@ async def run() -> int:
             tg, tg_broken = None, True
 
     stats = {'messages': 0, 'no_phone': 0, 'duplicate': 0, 'bump': 0,
-             'skip': 0, 'new': 0, 'update': 0, 'error': 0}
+             'skip': 0, 'hold': 0, 'new': 0, 'update': 0, 'error': 0}
     new_titles, upd_titles, skipped, errors = [], [], [], []
     done_ids: dict[str, int] = {}
 
@@ -702,7 +739,23 @@ async def run() -> int:
                 # Далёкие города отсекаем сами: модель иногда пропускает их.
                 far = [it for it, _ in pairs if is_far(it.ad.place, it.ad.title)]
                 pairs = [(it, part) for it, part in pairs if it not in far]
-                if not pairs:
+                # Сомнительное и запрещённое — не в ленту, а владельцу на
+                # проверку (очередь «Добавить объявление», ingest_hold).
+                held = [(it, part) for it, part in pairs if it.moderation.verdict != 'ok']
+                pairs = [(it, part) for it, part in pairs if it.moderation.verdict == 'ok']
+                held_note = None
+                if held:
+                    if not DRY:
+                        db.rpc('ingest_hold', {'p': {
+                            'source': key, 'message_id': m.id, 'source_text': text,
+                            'text_hash': h,
+                            'items': [to_item(it, part, cands) for it, part in held]}})
+                    stats['hold'] += 1
+                    held_note = 'на проверке: ' + '; '.join(
+                        it.moderation.reason or it.moderation.verdict for it, _ in held)
+                if not pairs and held:
+                    db.log(**base, decision='hold', note=held_note[:500])
+                elif not pairs:
                     reason = (far_reason(far[0].ad.place, far[0].ad.title) if far
                               else (reasons[0] if reasons else ''))[:200] or None
                     stats['skip'] += 1
@@ -732,7 +785,9 @@ async def run() -> int:
                         slugs.append(slug)
                     kind = 'new' if 'new' in kinds else 'update'
                     stats[kind] += 1
-                    db.log(**base, decision=kind, slugs=slugs, note=cut[2:] or None)
+                    note = '; '.join(x for x in [cut[2:], held_note] if x) or None
+                    db.log(**base, decision=kind, slugs=slugs,
+                           note=note[:500] if note else None)
             except Exception as e:  # одно сообщение не должно ронять весь проход
                 stats['error'] += 1
                 errors.append(f'{key}#{m.id}: {type(e).__name__}: {str(e)[:200]}')
@@ -777,6 +832,8 @@ def make_summary(stats, new, updated, errors, active) -> str:
         f'Повторов: {repeats}',
         f'Не работа: {stats["skip"] + stats["no_phone"]}',
     ]
+    if stats['hold']:
+        lines.append(f'На проверку: {stats["hold"]}')
     if active is not None:
         lines.append(f'В ленте: {active}')
     if errors:
