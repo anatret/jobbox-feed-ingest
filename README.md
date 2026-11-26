@@ -14,3 +14,10 @@
 и проверяете `python tool/feed_sync_check.py` там же.
 
 Репозиторий публичный: не выводить в лог тексты объявлений, телефоны, названия.
+
+## KakaoTalk
+
+Запись с `"kakao"` в `sources.json` — открытый чат KakaoTalk. Его сообщения не
+читаются отсюда: их кладёт в таблицу `kakao_inbox` телефон владельца (приложение
+`tool/kakao_collector` в jobboxv3). `ingest.py` разбирает новые строки очереди
+вместе с Telegram. `INGEST_ONLY=kakao` — только очередь, без Telegram.

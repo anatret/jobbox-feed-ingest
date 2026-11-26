@@ -109,5 +109,10 @@
   {
     "chat": "gyeonggikr",
     "note": "Кёнгидо"
+  },
+  {
+    "kakao": "Постоянка в Инчене",
+    "source": "kakao/postoyanka-incheon",
+    "note": "открытый чат KakaoTalk, очередь kakao_inbox с телефона владельца"
   }
 ]

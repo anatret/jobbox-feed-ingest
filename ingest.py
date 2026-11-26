@@ -1,4 +1,4 @@
-"""Автозагрузка объявлений о работе из Telegram в ленту JobBox.
+"""Автозагрузка объявлений о работе из Telegram и KakaoTalk в ленту JobBox.
 
 Запускается по расписанию в GitHub Actions (.github/workflows/feed-ingest.yml),
 можно и вручную. Telegram — только чтение под аккаунтом владельца.
@@ -12,6 +12,12 @@
      телефоном из базы) → запись через RPC ingest_upsert_ad.
   4. Журнал feed_ingest_log, состояние feed_ingest_state, отчёт в Telegram.
 
+KakaoTalk: телефон владельца (tool/kakao_collector в jobboxv3) кладёт
+сообщения открытого чата в таблицу kakao_inbox. Источник в sources.json —
+запись с ключом "kakao"; message_id = KAKAO_ID_BASE + id строки очереди.
+Kakao обрезает текст в уведомлении до 500 знаков (truncated): телефон часто
+отрезан, поэтому такой текст сравниваем с НАЧАЛОМ прежних полных постов.
+
 Переменные окружения:
   TG_API_ID, TG_API_HASH, TG_SESSION   — Telegram (StringSession, см. export_session.py)
   OPENAI_API_KEY                       — тот же ключ, что у parse-job-terms
@@ -20,6 +26,7 @@
   INGEST_MAX       — не больше N разборов моделью за запуск (по умолчанию 120)
   INGEST_DRY_RUN=1 — ничего не писать в базу и не слать отчёт (проверка)
   INGEST_REPORT_TO — кому отчёт (по умолчанию «me» — Избранное владельца)
+  INGEST_ONLY=kakao — только очередь Kakao, без Telegram (проверка)
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -49,8 +57,13 @@ SAME_TEXT_WINDOW = timedelta(days=3)
 # телефона не меньше 85% за последнюю неделю — поднимаем без модели.
 SIMILAR_MIN = 0.85
 SIMILAR_WINDOW = timedelta(days=7)
+# Обрезанный уведомлением текст Kakao: совпадение с началом прежнего поста.
+PREFIX_MIN = 0.9
+# Номера сообщений Kakao в feed_ingest_log: ручные выгрузки заняли 0–2xxx.
+KAKAO_ID_BASE = 100_000
 
 DRY = os.environ.get('INGEST_DRY_RUN') == '1'
+ONLY = os.environ.get('INGEST_ONLY') or ''
 MODEL = os.environ.get('OPENAI_MODEL') or 'gpt-4.1-mini'
 MAX_PARSE = int(os.environ.get('INGEST_MAX') or '120')
 
@@ -151,9 +164,10 @@ class Db:
         rows = r.json()
         return rows[0] if rows else None
 
-    def similar(self, phones: list[str], norm: str) -> Optional[dict]:
+    def similar(self, phones: list[str], norm: str, prefix: bool = False) -> Optional[dict]:
         """Самый похожий прежний пост с тем же телефоном (за неделю), если
-        совпадает не меньше чем на SIMILAR_MIN. Возвращает строку журнала + ratio."""
+        совпадает не меньше чем на SIMILAR_MIN. Возвращает строку журнала + ratio.
+        prefix — текст обрезан: сравнивать с началом прежнего поста."""
         since = (datetime.now(timezone.utc) - SIMILAR_WINDOW).isoformat()
         r = self.http.get('/feed_ingest_log', params={
             'select': 'decision,slugs,text_norm',
@@ -163,14 +177,29 @@ class Db:
             'created_at': f'gte.{since}',
             'order': 'created_at.desc', 'limit': '40'})
         r.raise_for_status()
-        best = None
-        for row in r.json():
-            if not row['slugs']:
-                continue
-            ratio = SequenceMatcher(None, norm, row['text_norm'], autojunk=False).ratio()
-            if ratio >= SIMILAR_MIN and (best is None or ratio > best['ratio']):
-                best = {**row, 'ratio': ratio}
-        return best
+        return best_match(r.json(), norm, prefix, PREFIX_MIN if prefix else SIMILAR_MIN)
+
+    def prefix_match(self, source: str, norm: str) -> Optional[dict]:
+        """Обрезанный текст без телефона: прежний пост того же источника
+        (за неделю), начало которого совпадает не меньше чем на PREFIX_MIN."""
+        since = (datetime.now(timezone.utc) - SIMILAR_WINDOW).isoformat()
+        r = self.http.get('/feed_ingest_log', params={
+            'select': 'decision,slugs,text_norm',
+            'source': f'eq.{source}',
+            'decision': 'in.(new,update,bump)',
+            'text_norm': 'not.is.null',
+            'created_at': f'gte.{since}',
+            'order': 'created_at.desc', 'limit': '500'})
+        r.raise_for_status()
+        return best_match(r.json(), norm, True, PREFIX_MIN)
+
+    def kakao_inbox(self, source: str, after_id: int) -> list[dict]:
+        r = self.http.get('/kakao_inbox', params={
+            'select': 'id,sender,posted_at,text,truncated',
+            'source': f'eq.{source}', 'id': f'gt.{after_id}',
+            'order': 'id', 'limit': '300'})
+        r.raise_for_status()
+        return r.json()
 
     def last_bump(self, slugs: list[str]) -> Optional[datetime]:
         r = self.http.get('/feed_ingest_log', params={
@@ -205,6 +234,21 @@ class Db:
         r = self.http.get('/job_listings', params={'select': 'slug', 'slug': f'eq.{slug}'})
         r.raise_for_status()
         return bool(r.json())
+
+
+def best_match(rows: list[dict], norm: str, prefix: bool, need: float) -> Optional[dict]:
+    """Лучшее совпадение текста со строками журнала; prefix — с их началом."""
+    if prefix and len(norm) < 80:
+        return None  # слишком мало текста для сравнения
+    best = None
+    for row in rows:
+        if not row['slugs']:
+            continue
+        other = row['text_norm'][:len(norm)] if prefix else row['text_norm']
+        ratio = SequenceMatcher(None, norm, other, autojunk=False).ratio()
+        if ratio >= need and (best is None or ratio > best['ratio']):
+            best = {**row, 'ratio': ratio}
+    return best
 
 
 # ---------- разбор ----------
@@ -250,9 +294,9 @@ def is_far(place: str, title: str = '') -> bool:
     return bool(FAR_RE.search(s)) and not OURS_RE.search(s)
 
 
-def slugify(hint: str, h: str) -> str:
+def slugify(hint: str, h: str, prefix: str = 'tg') -> str:
     s = re.sub(r'[^a-z0-9]+', '-', hint.lower()).strip('-')[:48] or 'ad'
-    return f'tg-{s}-{h[:6]}'
+    return f'{prefix}-{s}-{h[:6]}'
 
 
 def _nullable(t: str) -> dict:
@@ -394,6 +438,40 @@ def to_row(item: Item, slug: str) -> dict:
     }
 
 
+# ---------- источники ----------
+
+@dataclass
+class Msg:
+    key: str            # источник: чат Telegram (/тема) или kakao/…
+    id: int             # message_id в feed_ingest_log
+    date: datetime
+    text: str
+    sender: str
+    truncated: bool = False
+
+    @property
+    def slug_prefix(self) -> str:
+        return 'kk' if self.key.startswith('kakao/') else 'tg'
+
+
+def fetch_kakao(db: 'Db', sources, state) -> list[Msg]:
+    """Неразобранные строки очереди kakao_inbox (с телефона владельца)."""
+    out = []
+    for src in sources:
+        if not src.get('kakao'):
+            continue
+        key = src['source']
+        last = state.get(key, 0)
+        rows = db.kakao_inbox(key, max(last - KAKAO_ID_BASE, 0))
+        for row in rows:
+            out.append(Msg(key, KAKAO_ID_BASE + row['id'],
+                           datetime.fromisoformat(row['posted_at']),
+                           (row['text'] or '').strip(), row['sender'] or 'Без имени',
+                           bool(row['truncated'])))
+        state[key] = max([last] + [KAKAO_ID_BASE + row['id'] for row in rows])
+    return out
+
+
 # ---------- Telegram ----------
 
 def sender_name(msg) -> str:
@@ -406,11 +484,13 @@ def sender_name(msg) -> str:
     return name or getattr(s, 'title', None) or getattr(s, 'username', None) or 'Без имени'
 
 
-async def fetch(tg, sources, state) -> list[tuple[str, object]]:
-    """Новые сообщения всех источников: [(source_key, message)], по времени."""
+async def fetch(tg, sources, state) -> list[Msg]:
+    """Новые сообщения всех чатов Telegram."""
     out = []
     since = datetime.now(timezone.utc) - timedelta(hours=2)
     for src in sources:
+        if src.get('kakao'):
+            continue
         key = src['chat'] + (f'/{src["topic_id"]}' if src.get('topic_id') else '')
         entity = await tg.get_entity(src['chat'])
         last = state.get(key, 0)
@@ -422,9 +502,8 @@ async def fetch(tg, sources, state) -> list[tuple[str, object]]:
             if not m.action:
                 msgs.append(m)
         for m in msgs:
-            out.append((key, m))
+            out.append(Msg(key, m.id, m.date, (m.message or '').strip(), sender_name(m)))
         state[key] = max([last] + [m.id for m in msgs])
-    out.sort(key=lambda x: x[1].date)
     return out
 
 
@@ -437,13 +516,18 @@ async def run() -> int:
     state = db.state()
     start_state = dict(state)
 
-    tg = TelegramClient(StringSession(os.environ['TG_SESSION']),
-                        int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'],
-                        device_model='JobBox ingest', app_version='1.0')
-    await tg.connect()
-    if not await tg.is_user_authorized():
-        print('Telegram: сессия недействительна — нужен новый TG_SESSION', file=sys.stderr)
-        return 2
+    tg = None
+    tg_broken = False
+    if ONLY != 'kakao':
+        tg = TelegramClient(StringSession(os.environ['TG_SESSION']),
+                            int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'],
+                            device_model='JobBox ingest', app_version='1.0')
+        await tg.connect()
+        if not await tg.is_user_authorized():
+            # Kakao разбираем всё равно — Telegram для него не нужен.
+            print('Telegram: сессия недействительна — нужен новый TG_SESSION', file=sys.stderr)
+            await tg.disconnect()
+            tg, tg_broken = None, True
 
     stats = {'messages': 0, 'no_phone': 0, 'duplicate': 0, 'bump': 0,
              'skip': 0, 'new': 0, 'update': 0, 'error': 0}
@@ -451,15 +535,19 @@ async def run() -> int:
     done_ids: dict[str, int] = {}
 
     try:
-        batch = await fetch(tg, sources, state)
-        for key, m in batch:
+        batch = (await fetch(tg, sources, state)) if tg else []
+        batch += fetch_kakao(db, sources, state)
+        batch.sort(key=lambda x: x.date)
+        for m in batch:
+            key = m.key
             stats['messages'] += 1
-            text = (m.message or '').strip()
+            text = m.text
             h = text_hash(text) if text else 'empty'
             base = {'source': key, 'message_id': m.id,
                     'posted_at': m.date.isoformat(), 'text_hash': h}
             phones = phones_of(text)
-            if not phones:
+            cut = '; текст обрезан уведомлением' if m.truncated else ''
+            if not phones and not m.truncated:
                 stats['no_phone'] += 1
                 db.log(**base, decision='skip', note='нет телефона')
                 done_ids[key] = max(done_ids.get(key, 0), m.id)
@@ -469,12 +557,20 @@ async def run() -> int:
             base.update(phones=phones, text_norm=norm)
             # Тот же текст — или почти тот же пост с тем же телефоном
             # (рекрутер поменял время, «срочно», цену): поднять, без модели.
+            # Обрезанный текст Kakao — сравнить с началом прежних постов.
             prev = db.seen(h)
             similar = None
-            if not prev:
-                prev = similar = db.similar(phones, norm)
+            if not prev and phones:
+                prev = similar = db.similar(phones, norm, prefix=m.truncated)
+            if not prev and m.truncated:
+                prev = similar = db.prefix_match(key, norm)
+            if not prev and not phones:
+                stats['no_phone'] += 1
+                db.log(**base, decision='skip', note='нет телефона' + cut)
+                done_ids[key] = max(done_ids.get(key, 0), m.id)
+                continue
             if prev:
-                why = (f'похоже на прежний пост на {round(similar["ratio"] * 100)}%'
+                why = (f'похоже на прежний пост на {round(similar["ratio"] * 100)}%{cut}'
                        if similar else None)
                 if prev['decision'] == 'skip' or not prev['slugs']:
                     stats['duplicate'] += 1
@@ -498,7 +594,7 @@ async def run() -> int:
 
             try:
                 cands = db.rpc('ingest_find_by_phones', {'p_phones': phones})
-                dec = parser.decide(text, sender_name(m), m.date, cands)
+                dec = parser.decide(text, m.sender, m.date, cands)
                 # Далёкие города отсекаем сами: модель иногда пропускает их.
                 far = [it for it in dec.items if is_far(it.ad.place, it.ad.title)]
                 if far:
@@ -518,10 +614,10 @@ async def run() -> int:
                             kinds.add('update')
                             upd_titles.append(it.ad.title)
                         else:
-                            slug = slugify(it.slug_hint, h)
+                            slug = slugify(it.slug_hint, h, m.slug_prefix)
                             n = 2
                             while slug in slugs or (not DRY and db.slug_taken(slug)):
-                                slug = f'{slugify(it.slug_hint, h)}-{n}'
+                                slug = f'{slugify(it.slug_hint, h, m.slug_prefix)}-{n}'
                                 n += 1
                             kinds.add('new')
                             new_titles.append(f'{it.ad.title} ({it.ad.place})')
@@ -531,7 +627,7 @@ async def run() -> int:
                         slugs.append(slug)
                     kind = 'new' if 'new' in kinds else 'update'
                     stats[kind] += 1
-                    db.log(**base, decision=kind, slugs=slugs)
+                    db.log(**base, decision=kind, slugs=slugs, note=cut[2:] or None)
             except Exception as e:  # одно сообщение не должно ронять весь проход
                 stats['error'] += 1
                 errors.append(f'{key}#{m.id}: {type(e).__name__}: {str(e)[:200]}')
@@ -554,11 +650,14 @@ async def run() -> int:
         if parser.calls:
             print(f'OpenAI ({MODEL}): {parser.calls} разборов, '
                   f'токенов {parser.tokens_in}/{parser.tokens_out}')
-        if not DRY and (stats['new'] or stats['update'] or stats['error']):
+        if tg and not DRY and (stats['new'] or stats['update'] or stats['error']):
             await tg.send_message(os.environ.get('INGEST_REPORT_TO', 'me'), summary,
                                   silent=not stats['error'])
     finally:
-        await tg.disconnect()
+        if tg:
+            await tg.disconnect()
+    if tg_broken:
+        return 2
     return 1 if stats['error'] and not (stats['new'] or stats['update']) else 0
 
 
